@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+#, 5.5, 6
 
 import logging
 import math
@@ -21,7 +21,8 @@ import random
 import Queue
 from util import Job, TaskDistributions
 
-MEDIAN_TASK_DURATION = 100
+TASK_DURATION0 = 1000
+TASK_DURATION1 = 100
 NETWORK_DELAY = 0.5
 TASKS_PER_JOB = 100
 SLOTS_PER_WORKER = 4
@@ -29,7 +30,11 @@ TOTAL_WORKERS = 10000
 PROBE_RATIO = 2
 CANCELLATION = False
 WORK_STEALING = False
-NUM_SCHEDULERS = 1
+NUM_SCHEDULERS = 2
+
+job_list_type_0 = []
+job_list_type_1 = []
+
 
 def get_percentile(N, percent, key=lambda x:x):
     if not N:
@@ -61,8 +66,7 @@ class Event(object):
         """ Returns any events that should be added to the queue. """
         raise NotImplementedError("The run() method must be implemented by "
                                   "each class subclassing Event")
-
-class JobArrival(Event):
+class JobArrival0(Event):
     """ Event to signify a job arriving at a scheduler. """
     def __init__(self, simulation, interarrival_delay, task_distribution):
         self.simulation = simulation
@@ -71,8 +75,30 @@ class JobArrival(Event):
 
     def run(self, current_time):
         scheduler = random.randint(0, NUM_SCHEDULERS - 1)
-        job = Job(TASKS_PER_JOB, current_time, self.task_distribution, MEDIAN_TASK_DURATION,
+        job = Job(TASKS_PER_JOB, current_time, self.task_distribution, TASK_DURATION0,
                   scheduler)
+        job_list_type_0.append(job.id)
+        #print "Job %s arrived at %s" % (job.id, current_time)
+        # Schedule job.
+        new_events = self.simulation.send_probes(job, current_time)
+        # Add new Job Arrival event, for the next job to arrive after this one.
+        arrival_delay = random.expovariate(1.0 / self.interarrival_delay)
+        new_events.append((current_time + arrival_delay, self))
+        #print "Retuning %s events" % len(new_events)
+        return new_events
+
+class JobArrival1(Event):
+    """ Event to signify a job arriving at a scheduler. """
+    def __init__(self, simulation, interarrival_delay, task_distribution):
+        self.simulation = simulation
+        self.interarrival_delay = interarrival_delay
+        self.task_distribution = task_distribution
+
+    def run(self, current_time):
+        scheduler = random.randint(0, NUM_SCHEDULERS - 1)
+        job = Job(TASKS_PER_JOB, current_time, self.task_distribution, TASK_DURATION1,
+                  scheduler)
+        job_list_type_1.append(job.id)
         #print "Job %s arrived at %s" % (job.id, current_time)
         # Schedule job.
         new_events = self.simulation.send_probes(job, current_time)
@@ -123,14 +149,14 @@ class CancellationEvent():
 class Worker(object):
     def __init__(self, simulation, num_slots, id):
         self.simulation = simulation
-
+        self.current_jobid = -1
         # List of times when slots were freed, for each free slot (used to track the time
         # the worker spends idle).
         self.free_slots = []
         while len(self.free_slots) < num_slots:
             self.free_slots.append(0)
         self.idle_ms = 0
-
+        
         # Just a list of job ids!
         self.queued_probes = []
         self.id = id
@@ -143,6 +169,7 @@ class Worker(object):
     def free_slot(self, current_time):
         """ Frees a slot on the worker and attempts to launch another task in that slot. """
         self.free_slots.append(current_time)
+        self.current_jobid = -1
         get_task_events = self.maybe_get_task(current_time)
         if len(get_task_events) > 0:
             return get_task_events
@@ -166,6 +193,7 @@ class Worker(object):
 
             job_id = self.queued_probes[0]
             self.queued_probes = self.queued_probes[1:]
+            self.current_jobid = job_id
 
             return self.simulation.get_task(job_id, self, current_time)
         return []
@@ -183,11 +211,15 @@ class Worker(object):
             self.idle_ms += time_freed - current_time
 
 class Simulation(object):
+    fairness_pair_list = []
     def __init__(self, num_jobs, file_prefix, load, task_distribution):
-        avg_used_slots = load * SLOTS_PER_WORKER * TOTAL_WORKERS
-        self.interarrival_delay = (1.0 * MEDIAN_TASK_DURATION * TASKS_PER_JOB / avg_used_slots)
-        print ("Interarrival delay: %s (avg slots in use: %s)" %
-               (self.interarrival_delay, avg_used_slots))
+        avg_used_slots = load*0.5 * SLOTS_PER_WORKER * TOTAL_WORKERS
+        self.interarrival_delay0 = (1.0 * TASK_DURATION0 * TASKS_PER_JOB / avg_used_slots)
+        self.interarrival_delay1 = (1.0 * TASK_DURATION1 * TASKS_PER_JOB / avg_used_slots)
+        print ("Interarrival delay0: %s (avg slots in use: %s)" %
+               (self.interarrival_delay0, avg_used_slots))
+        print ("Interarrival delay1: %s (avg slots in use: %s)" %
+               (self.interarrival_delay1, avg_used_slots))
         self.jobs = {}
         self.unscheduled_jobs = []
         while len(self.unscheduled_jobs) < NUM_SCHEDULERS:
@@ -280,7 +312,8 @@ class Simulation(object):
             #       (job_id, self.jobs[job_id].end_time - self.jobs[job_id].start_time))
 
     def run(self):
-        self.event_queue.put((0, JobArrival(self, self.interarrival_delay, self.task_distribution)))
+        self.event_queue.put((0, JobArrival0(self, self.interarrival_delay0, self.task_distribution)))
+        self.event_queue.put((0, JobArrival1(self, self.interarrival_delay1, self.task_distribution)))
         last_time = 0
         last_report = self.remaining_jobs
         half_jobs = self.remaining_jobs / 2
@@ -295,7 +328,18 @@ class Simulation(object):
                 worker_loads = [len(w.free_slots) for w in self.workers]
                 plot_cdf(worker_loads, "%s_worker_loads.data" % self.file_prefix)
                 output_worker_loads = True
-
+            current_jobs = [w.current_jobid for w in self.workers]
+            type0 = 0
+            type1 = 0
+            for item in current_jobs:
+                if item in job_list_type_0:
+                    type0 += 1
+                elif item in job_list_type_1:
+                    type1 += 1
+            pair = []
+            pair.append(type0)
+            pair.append(type1)
+            self.fairness_pair_list.append(pair)
             current_time, event = self.event_queue.get()
             assert current_time >= last_time
             last_time = current_time
